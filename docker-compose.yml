@@ -1,0 +1,21 @@
+services:
+  logging-service:
+    build: ./logging-service
+    container_name: logging-service
+    ports:
+      - "5001:5001"
+
+  counter-service:
+    build: ./counter-service
+    container_name: counter-service
+    ports:
+      - "5002:5002"
+
+  facade-service:
+    build: ./facade-service
+    container_name: facade-service
+    depends_on:
+      - logging-service
+      - counter-service
+    ports:
+      - "5000:5000"
