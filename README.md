@@ -16,3 +16,24 @@
 
 Клієнт відправляє GET запит на facade-service. Отримавши запит facade-service генерує GET-запити до logging-service та messages-service за допомогою програмного REST/HTTP-client. logging-service отримавши запит повертає всі повідомлення (без ключів) які зберігаються у хеш-таблиці у вигляді рядка messages-service отримавши запит повертає статичний текст, наприклад ‘not implemented yet’. facade-service отримавши відповіді від logging-service та messages-service конкатенує текст обох відповідей та повертає клієнту.
 
+### Запуск
+
+В папці проекту
+```{bash}
+docker compose up --build
+```
+
+
+Перевірка роботи сервісів
+```{bash}
+http://localhost:5000/health
+```
+Очікуваний результат - {"status":"ok"}
+
+Приклад транзакції:
+```{bash}
+curl -X POST http://localhost:5000/transaction -H "Content-Type: application/json" -d '{"user_id":"u1", "amount":-30}'
+```
+
+
+
