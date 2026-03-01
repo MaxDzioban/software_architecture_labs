@@ -1,0 +1,48 @@
+services:
+  hz1:
+    image: hazelcast/hazelcast:5.3.1
+    container_name: hz1
+    command: ["hz", "start", "-c", "/opt/hazelcast/config/hazelcast.yaml"]
+    volumes:
+      - ./hazelcast.yaml:/opt/hazelcast/config/hazelcast.yaml:ro
+    ports:
+      - "5701:5701"
+
+  hz2:
+    image: hazelcast/hazelcast:5.3.1
+    container_name: hz2
+    command: ["hz", "start", "-c", "/opt/hazelcast/config/hazelcast.yaml"]
+    volumes:
+      - ./hazelcast.yaml:/opt/hazelcast/config/hazelcast.yaml:ro
+
+  hz3:
+    image: hazelcast/hazelcast:5.3.1
+    container_name: hz3
+    command: ["hz", "start", "-c", "/opt/hazelcast/config/hazelcast.yaml"]
+    volumes:
+      - ./hazelcast.yaml:/opt/hazelcast/config/hazelcast.yaml:ro
+
+
+  management-center:
+    image: hazelcast/management-center:5.3.4
+    container_name: mc
+    ports:
+      - "8080:8080"
+    environment:
+      - MC_DEFAULT_CLUSTER=dev
+      - MC_DEFAULT_CLUSTER_MEMBERS=hz1,hz2,hz3
+
+  py-client:
+    build: ./client
+    container_name: py-client
+    depends_on:
+      - hz1
+      - hz2
+      - hz3
+    environment:
+      - HZ_CLUSTER_NAME=dev
+      - HZ_MEMBERS=hz1:5701,hz2:5701,hz3:5701
+    volumes:
+      - ./client:/app
+    working_dir: /app
+    entrypoint: ["tail", "-f", "/dev/null"]

@@ -1,0 +1,15 @@
+hazelcast:
+  cluster-name: dev
+  map:
+    default:
+      backup-count: 2
+      async-backup-count: 0
+
+    demo-map:
+      backup-count: 2
+      async-backup-count: 0
+
+  queue:
+    bounded-queue:
+      max-size: 10
+
