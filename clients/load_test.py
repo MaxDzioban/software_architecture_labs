@@ -4,77 +4,89 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 
-FACADE = "http://localhost:5000"
+FACADE_URL = "http://localhost:5000"
 
 def do_posts(user_id: str, count: int, amount: int):
-    s = requests.Session()
+    session = requests.Session()
     ok = 0
     for _ in range(count):
-        r = s.post(
-            f"{FACADE}/transaction",
+        response = session.post(
+            f"{FACADE_URL}/transaction",
             headers={"Content-Type": "application/json"},
-            data=json.dumps({"user_id": user_id, "amount": amount}),
-            timeout=10,)
-        if r.status_code == 200:
+            data=json.dumps({
+                "user_id": user_id,
+                "amount": amount
+            }),
+            timeout=10
+        )
+        if response.status_code == 200:
             ok += 1
     return ok
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--clients", type=int, default=10)
-    p.add_argument("--per-client", type=int, default=10000)
-    p.add_argument("--amount", type=int, default=1)
-    p.add_argument("--scenario", type=int, choices=[1, 2], required=True)
-    args = p.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--scenario", type=int, choices=[1, 2], required=True)
+    parser.add_argument("--clients", type=int, default=10)
+    parser.add_argument("--per-client", type=int, default=10000)
+    parser.add_argument("--amount", type=int, default=1)
+    args = parser.parse_args()
 
-    requests.post(f"{FACADE}/stats/reset", timeout=5)
+    requests.post(f"{FACADE_URL}/stats/reset", timeout=5)
     requests.post("http://localhost:5002/reset", timeout=5)
-    clients = args.clients
-    per_client = args.per_client
-    amount = args.amount
-
     if args.scenario == 1:
-        user_ids = [f"user_{i}" for i in range(clients)]
+        user_ids = [f"user_{i}" for i in range(args.clients)]
     else:
-        user_ids = ["one_user"] * clients
-
-    total_requests = clients * per_client
-
-    t0 = time.perf_counter()
+        user_ids = ["one_user"] * args.clients
+    total_requests = args.clients * args.per_client
+    start = time.perf_counter()
     ok_total = 0
-    with ThreadPoolExecutor(max_workers=clients) as ex:
-        futures = [ex.submit(do_posts, user_ids[i], per_client, amount) for i in range(clients)]
-        for f in as_completed(futures):
-            ok_total += f.result()
-    t1 = time.perf_counter()
-
-    elapsed = t1 - t0
+    with ThreadPoolExecutor(max_workers=args.clients) as executor:
+        futures = [
+            executor.submit(do_posts, user_ids[i], args.per_client, args.amount)
+            for i in range(args.clients)
+        ]
+        for future in as_completed(futures):
+            ok_total += future.result()
+    elapsed = time.perf_counter() - start
     rps = total_requests / elapsed if elapsed > 0 else 0.0
+    stats = requests.get(f"{FACADE_URL}/stats", timeout=5).json()
 
-    stats = requests.get(f"{FACADE}/stats", timeout=5).json()
-
+    print("=== RESULT ===")
     print(f"Scenario: {args.scenario}")
-    print(f"Clients: {clients}, per_client: {per_client}, total_requests: {total_requests}")
+    print(f"Clients: {args.clients}, per_client: {args.per_client}, total_requests: {total_requests}")
     print(f"OK responses: {ok_total}")
     print(f"Total time (sec): {elapsed:.4f}")
     print(f"Requests/sec: {rps:.2f}")
-    print(f"logging calls: {stats['logging_calls']}, total time sec: {stats['logging_time_sec']:.4f}, avg ms: {stats['logging_avg_ms']:.3f}")
-    print(f"counter  calls: {stats['counter_calls']}, total time sec: {stats['counter_time_sec']:.4f}, avg ms: {stats['counter_avg_ms']:.3f}")
+
+    print("\n=== FACADE REMOTE CALL CONTRIBUTION ===")
+    print(
+        f"logging calls: {stats['logging_calls']}, "
+        f"total time sec: {stats['logging_time_sec']:.4f}, "
+        f"avg ms: {stats['logging_avg_ms']:.3f}"
+    )
+    print(
+        f"counter calls: {stats['counter_calls']}, "
+        f"total time sec: {stats['counter_time_sec']:.4f}, "
+        f"avg ms: {stats['counter_avg_ms']:.3f}"
+    )
 
     if args.scenario == 1:
-        expected = per_client * amount
-        bad = 0
-        for uid in user_ids:
-            bal = requests.get(f"{FACADE}/user/{uid}", timeout=5).json()["balance"]
-            if bal != expected:
-                bad += 1
-        print()
-        print(f"Balance check: expected={expected}, bad_accounts={bad}/{clients}")
+        expected = args.per_client * args.amount
+        bad_accounts = 0
+        for user_id in user_ids:
+            balance = requests.get(f"{FACADE_URL}/user/{user_id}", timeout=5).json()["balance"]
+            if balance != expected:
+                bad_accounts += 1
+
+        print("\nBalance check:")
+        print(f"expected={expected}, bad_accounts={bad_accounts}/{args.clients}")
+
     else:
-        expected = (clients * per_client) * amount
-        bal = requests.get(f"{FACADE}/user/one_user", timeout=5).json()["balance"]
-        print()
-        print(f"Balance check: expected={expected}, actual={bal}")
+        expected = args.clients * args.per_client * args.amount
+        balance = requests.get(f"{FACADE_URL}/user/one_user", timeout=5).json()["balance"]
+
+        print("\nBalance check:")
+        print(f"expected={expected}, actual={balance}")
 
 if __name__ == "__main__":
     main()

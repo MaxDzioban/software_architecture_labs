@@ -1,52 +1,85 @@
+import json
+import os
+import time
+
 from flask import Flask, request, jsonify
-from threading import Lock
+import hazelcast
+
 app = Flask(__name__)
 
-TX = {}
-lock = Lock()
+INSTANCE_NAME = os.getenv("INSTANCE_NAME", "logging-service")
+HAZELCAST_MEMBERS = os.getenv(
+    "HAZELCAST_MEMBERS",
+    "hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701"
+).split(",")
 
-@app.post("/log")
-def log_tx():
+hazelcast_client = hazelcast.HazelcastClient(
+    cluster_members=HAZELCAST_MEMBERS
+)
+
+transactions_map = hazelcast_client.get_map("transactions").blocking()
+
+
+@app.route("/log", methods=["POST"])
+def log_transaction():
     data = request.get_json(force=True, silent=False)
+
     required = ["transaction_id", "user_id", "amount", "timestamp"]
-    for k in required:
-        if k not in data:
-            return jsonify({"error": f"missing field: {k}"}), 400
+    for field in required:
+        if field not in data:
+            return jsonify({"error": f"missing field: {field}"}), 400
 
     tx_id = str(data["transaction_id"])
-    with lock:
-        TX[tx_id] = {
-            "transaction_id": tx_id,
-            "user_id": str(data["user_id"]),
-            "amount": int(data["amount"]),
-            "timestamp": data["timestamp"],
-        }
-    app.logger.info(f"LOGGED: {TX[tx_id]}")
-    return jsonify({"status": "ok"}), 200
+    value = json.dumps({
+        "transaction_id": tx_id,
+        "user_id": str(data["user_id"]),
+        "amount": int(data["amount"]),
+        "timestamp": float(data["timestamp"]),
+        "logged_by": INSTANCE_NAME
+    })
+
+    app.logger.info(f"[{INSTANCE_NAME}] Received POST: id={tx_id} user={data['user_id']} amount={data['amount']}")
+    transactions_map.put(tx_id, value)
+    app.logger.info(f"[{INSTANCE_NAME}] Saved to Hazelcast")
+
+    return jsonify({"status": "ok", "instance": INSTANCE_NAME}), 200
 
 
-
-@app.get("/transactions")
-def get_all():
-    with lock:
-        return jsonify({"transactions": list(TX.values())}), 200
-
-
-
-@app.get("/transactions/<user_id>")
-def get_by_user(user_id):
-    uid = str(user_id)
-    with lock:
-        user_txs = [t for t in TX.values() if t["user_id"] == uid]
-    return jsonify({"user_id": uid, "transactions": user_txs}), 200
+@app.route("/transactions", methods=["GET"])
+def get_all_transactions():
+    entries = transactions_map.entry_set()
+    transactions = [json.loads(value) for _, value in entries]
+    return jsonify({
+        "instance": INSTANCE_NAME,
+        "transactions": transactions
+    }), 200
 
 
+@app.route("/transactions/<user_id>", methods=["GET"])
+def get_transactions_by_user(user_id):
+    entries = transactions_map.entry_set()
+    transactions = []
 
-@app.get("/health")
+    for _, value in entries:
+        item = json.loads(value)
+        if str(item["user_id"]) == str(user_id):
+            transactions.append(item)
+
+    return jsonify({
+        "instance": INSTANCE_NAME,
+        "user_id": str(user_id),
+        "transactions": transactions
+    }), 200
+
+
+@app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"}), 200
-
+    return jsonify({
+        "status": "ok",
+        "instance": INSTANCE_NAME,
+        "time": time.time()
+    }), 200
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5001)
+    app.run(host="0.0.0.0", port=5001, threaded=True)

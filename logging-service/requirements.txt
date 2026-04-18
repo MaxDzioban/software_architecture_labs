@@ -1,1 +1,2 @@
 Flask==3.0.3
+hazelcast-python-client==5.4.0

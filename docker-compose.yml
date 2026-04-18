@@ -1,21 +1,96 @@
 services:
-  logging-service:
-    build: ./logging-service
-    container_name: logging-service
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: bankdb
     ports:
-      - "5001:5001"
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d bankdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  hazelcast-1:
+    image: hazelcast/hazelcast:5.4.0
+    container_name: hazelcast-1
+    ports:
+      - "5701:5701"
+
+  hazelcast-2:
+    image: hazelcast/hazelcast:5.4.0
+    container_name: hazelcast-2
+    ports:
+      - "5702:5701"
+
+  hazelcast-3:
+    image: hazelcast/hazelcast:5.4.0
+    container_name: hazelcast-3
+    ports:
+      - "5703:5701"
+
+  logging-service-1:
+    build: ./logging-service
+    container_name: logging-service-1
+    environment:
+      INSTANCE_NAME: logging-service-1
+      HAZELCAST_MEMBERS: hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701
+    depends_on:
+      - hazelcast-1
+      - hazelcast-2
+      - hazelcast-3
+
+  logging-service-2:
+    build: ./logging-service
+    container_name: logging-service-2
+    environment:
+      INSTANCE_NAME: logging-service-2
+      HAZELCAST_MEMBERS: hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701
+    depends_on:
+      - hazelcast-1
+      - hazelcast-2
+      - hazelcast-3
+
+  logging-service-3:
+    build: ./logging-service
+    container_name: logging-service-3
+    environment:
+      INSTANCE_NAME: logging-service-3
+      HAZELCAST_MEMBERS: hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701
+    depends_on:
+      - hazelcast-1
+      - hazelcast-2
+      - hazelcast-3
 
   counter-service:
     build: ./counter-service
     container_name: counter-service
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: bankdb
+    depends_on:
+      - postgres
     ports:
       - "5002:5002"
 
   facade-service:
     build: ./facade-service
     container_name: facade-service
+    environment:
+      COUNTER_URL: http://counter-service:5002
+      LOGGING_URL_1: http://logging-service-1:5001
+      LOGGING_URL_2: http://logging-service-2:5001
+      LOGGING_URL_3: http://logging-service-3:5001
     depends_on:
-      - logging-service
       - counter-service
+      - logging-service-1
+      - logging-service-2
+      - logging-service-3
     ports:
       - "5000:5000"

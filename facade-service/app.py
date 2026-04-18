@@ -1,13 +1,21 @@
+import os
 import time
 import uuid
-from flask import Flask, request, jsonify
-import requests
+import random
 from threading import Lock
+
+import requests
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-LOGGING_URL = "http://logging-service:5001"
-COUNTER_URL = "http://counter-service:5002"
+COUNTER_URL = os.getenv("COUNTER_URL", "http://counter-service:5002")
+
+LOGGING_ENDPOINTS = [
+    os.getenv("LOGGING_URL_1", "http://logging-service-1:5001"),
+    os.getenv("LOGGING_URL_2", "http://logging-service-2:5001"),
+    os.getenv("LOGGING_URL_3", "http://logging-service-3:5001"),
+]
 
 stats_lock = Lock()
 stats = {
@@ -17,93 +25,166 @@ stats = {
     "counter_time_sec": 0.0,
 }
 
-def _timed_request(method, url, **kwargs):
-    start = time.perf_counter()
-    resp = requests.request(method, url, timeout=5, **kwargs)
-    elapsed = time.perf_counter() - start
-    return resp, elapsed
 
-def _add_stat(which: str, elapsed: float):
+def add_stat(service_name: str, elapsed: float):
     with stats_lock:
-        stats[f"{which}_calls"] += 1
-        stats[f"{which}_time_sec"] += elapsed
+        stats[f"{service_name}_calls"] += 1
+        stats[f"{service_name}_time_sec"] += elapsed
 
-@app.post("/transaction")
-def post_transaction():
+
+def timed_request(method: str, url: str, **kwargs):
+    start = time.perf_counter()
+    response = requests.request(method, url, timeout=20, **kwargs)
+    elapsed = time.perf_counter() - start
+    return response, elapsed
+
+
+def call_counter(method: str, path: str, **kwargs):
+    url = f"{COUNTER_URL}{path}"
+    response, elapsed = timed_request(method, url, **kwargs)
+    add_stat("counter", elapsed)
+    return response
+
+
+def call_logging_with_retry(method: str, path: str, **kwargs):
+    endpoints = LOGGING_ENDPOINTS[:]
+    random.shuffle(endpoints)
+
+    last_error = None
+
+    for base_url in endpoints:
+        try:
+            url = f"{base_url}{path}"
+            response, elapsed = timed_request(method, url, **kwargs)
+            add_stat("logging", elapsed)
+
+            if response.status_code < 500:
+                return response
+        except Exception as e:
+            last_error = e
+
+    if last_error:
+        raise last_error
+
+    raise RuntimeError("All logging-service instances failed")
+
+
+@app.route("/transaction", methods=["POST"])
+def create_transaction():
     data = request.get_json(force=True, silent=False)
+
     if "user_id" not in data or "amount" not in data:
-        return jsonify({"error": "required: {user_id, amount}"}), 400
+        return jsonify({"error": "required fields: user_id, amount"}), 400
 
-    user_id = str(data["user_id"])
-    amount = int(data["amount"])
-
-    ts = time.time()
-    tx_id = str(uuid.uuid4())
-
-    tx = {
-        "transaction_id": tx_id,
-        "user_id": user_id,
-        "amount": amount,
-        "timestamp": ts,
+    transaction = {
+        "transaction_id": str(uuid.uuid4()),
+        "user_id": str(data["user_id"]),
+        "amount": int(data["amount"]),
+        "timestamp": time.time()
     }
 
-    log_resp, log_t = _timed_request("POST", f"{LOGGING_URL}/log", json=tx)
-    _add_stat("logging", log_t)
-    if log_resp.status_code != 200:
-        return jsonify({"error": "logging-service failed", "details": log_resp.text}), 502
-    cnt_resp, cnt_t = _timed_request("POST", f"{COUNTER_URL}/apply", json={"user_id": user_id, "amount": amount})
-    _add_stat("counter", cnt_t)
-    if cnt_resp.status_code != 200:
-        return jsonify({"error": "counter-service failed", "details": cnt_resp.text}), 502
-    balance = cnt_resp.json().get("balance", 0)
-    return jsonify({"transaction_id": tx_id, "balance": balance}), 200
+    try:
+        counter_resp = call_counter("POST", "/apply", json=transaction)
+    except Exception as e:
+        return jsonify({"error": "counter-service unavailable", "details": str(e)}), 502
+
+    if counter_resp.status_code != 200:
+        return jsonify({
+            "error": "counter-service failed",
+            "details": counter_resp.text
+        }), 502
+
+    try:
+        logging_resp = call_logging_with_retry("POST", "/log", json=transaction)
+    except Exception as e:
+        return jsonify({"error": "all logging-service instances unavailable", "details": str(e)}), 502
+
+    if logging_resp.status_code != 200:
+        return jsonify({
+            "error": "logging-service failed",
+            "details": logging_resp.text
+        }), 502
+
+    balance = counter_resp.json().get("balance", 0)
+    return jsonify({
+        "transaction_id": transaction["transaction_id"],
+        "balance": balance
+    }), 200
 
 
+@app.route("/user/<user_id>", methods=["GET"])
+def get_user_info(user_id):
+    try:
+        counter_resp = call_counter("GET", f"/balance/{user_id}")
+    except Exception as e:
+        return jsonify({"error": "counter-service unavailable", "details": str(e)}), 502
 
-@app.get("/user/<user_id>")
-def get_user(user_id):
-    uid = str(user_id)
-    bal_resp, cnt_t = _timed_request("GET", f"{COUNTER_URL}/balance/{uid}")
-    _add_stat("counter", cnt_t)
-    if bal_resp.status_code != 200:
-        return jsonify({"error": "counter-service failed", "details": bal_resp.text}), 502
-    balance = bal_resp.json().get("balance", 0)
-    tx_resp, log_t = _timed_request("GET", f"{LOGGING_URL}/transactions/{uid}")
-    _add_stat("logging", log_t)
-    if tx_resp.status_code != 200:
-        return jsonify({"error": "logging-service failed", "details": tx_resp.text}), 502
-    transactions = tx_resp.json().get("transactions", [])
+    if counter_resp.status_code != 200:
+        return jsonify({
+            "error": "counter-service failed",
+            "details": counter_resp.text
+        }), 502
 
-    return jsonify({"user_id": uid, "balance": balance, "transactions": transactions}), 200
+    try:
+        logging_resp = call_logging_with_retry("GET", f"/transactions/{user_id}")
+    except Exception as e:
+        return jsonify({"error": "all logging-service instances unavailable", "details": str(e)}), 502
+
+    if logging_resp.status_code != 200:
+        return jsonify({
+            "error": "logging-service failed",
+            "details": logging_resp.text
+        }), 502
+
+    return jsonify({
+        "user_id": str(user_id),
+        "balance": counter_resp.json().get("balance", 0),
+        "transactions": logging_resp.json().get("transactions", [])
+    }), 200
 
 
-@app.get("/accounts")
+@app.route("/accounts", methods=["GET"])
 def get_accounts():
-    resp, cnt_t = _timed_request("GET", f"{COUNTER_URL}/accounts")
-    _add_stat("counter", cnt_t)
-    if resp.status_code != 200:
-        return jsonify({"error": "counter-service failed", "details": resp.text}), 502
-    return jsonify(resp.json()), 200
+    try:
+        response = call_counter("GET", "/accounts")
+    except Exception as e:
+        return jsonify({"error": "counter-service unavailable", "details": str(e)}), 502
 
-@app.get("/stats")
+    if response.status_code != 200:
+        return jsonify({"error": "counter-service failed", "details": response.text}), 502
+
+    return jsonify(response.json()), 200
+
+
+@app.route("/stats", methods=["GET"])
 def get_stats():
     with stats_lock:
-        s = dict(stats)
-    s["logging_avg_ms"] = (s["logging_time_sec"] / s["logging_calls"] * 1000) if s["logging_calls"] else 0.0
-    s["counter_avg_ms"] = (s["counter_time_sec"] / s["counter_calls"] * 1000) if s["counter_calls"] else 0.0
-    return jsonify(s), 200
+        result = dict(stats)
 
-@app.post("/stats/reset")
+    result["logging_avg_ms"] = (
+        result["logging_time_sec"] / result["logging_calls"] * 1000
+        if result["logging_calls"] else 0.0
+    )
+    result["counter_avg_ms"] = (
+        result["counter_time_sec"] / result["counter_calls"] * 1000
+        if result["counter_calls"] else 0.0
+    )
+
+    return jsonify(result), 200
+
+
+@app.route("/stats/reset", methods=["POST"])
 def reset_stats():
     with stats_lock:
         stats["logging_calls"] = 0
         stats["logging_time_sec"] = 0.0
         stats["counter_calls"] = 0
         stats["counter_time_sec"] = 0.0
+
     return jsonify({"status": "reset"}), 200
 
 
-@app.get("/health")
+@app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"}), 200
 
