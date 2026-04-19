@@ -1,4 +1,10 @@
 services:
+  config-server:
+    build: ./config-server
+    container_name: config-server
+    ports:
+      - "5005:5005"
+
   postgres:
     image: postgres:16
     container_name: postgres
@@ -8,11 +14,6 @@ services:
       POSTGRES_DB: bankdb
     ports:
       - "5432:5432"
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d bankdb"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
 
   hazelcast-1:
     image: hazelcast/hazelcast:5.4.0
@@ -37,8 +38,12 @@ services:
     container_name: logging-service-1
     environment:
       INSTANCE_NAME: logging-service-1
+      SERVICE_HOST: logging-service-1
+      SERVICE_PORT: 5001
+      CONFIG_SERVER_URL: http://config-server:5005
       HAZELCAST_MEMBERS: hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701
     depends_on:
+      - config-server
       - hazelcast-1
       - hazelcast-2
       - hazelcast-3
@@ -48,8 +53,12 @@ services:
     container_name: logging-service-2
     environment:
       INSTANCE_NAME: logging-service-2
+      SERVICE_HOST: logging-service-2
+      SERVICE_PORT: 5001
+      CONFIG_SERVER_URL: http://config-server:5005
       HAZELCAST_MEMBERS: hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701
     depends_on:
+      - config-server
       - hazelcast-1
       - hazelcast-2
       - hazelcast-3
@@ -59,8 +68,12 @@ services:
     container_name: logging-service-3
     environment:
       INSTANCE_NAME: logging-service-3
+      SERVICE_HOST: logging-service-3
+      SERVICE_PORT: 5001
+      CONFIG_SERVER_URL: http://config-server:5005
       HAZELCAST_MEMBERS: hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701
     depends_on:
+      - config-server
       - hazelcast-1
       - hazelcast-2
       - hazelcast-3
@@ -69,13 +82,22 @@ services:
     build: ./counter-service
     container_name: counter-service
     environment:
+      SERVICE_HOST: counter-service
+      SERVICE_PORT: 5002
+      CONFIG_SERVER_URL: http://config-server:5005
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
       POSTGRES_DB: bankdb
+      HAZELCAST_MEMBERS: hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701
+      QUEUE_NAME: counter-queue
     depends_on:
+      - config-server
       - postgres
+      - hazelcast-1
+      - hazelcast-2
+      - hazelcast-3
     ports:
       - "5002:5002"
 
@@ -83,11 +105,13 @@ services:
     build: ./facade-service
     container_name: facade-service
     environment:
-      COUNTER_URL: http://counter-service:5002
-      LOGGING_URL_1: http://logging-service-1:5001
-      LOGGING_URL_2: http://logging-service-2:5001
-      LOGGING_URL_3: http://logging-service-3:5001
+      SERVICE_HOST: facade-service
+      SERVICE_PORT: 5000
+      CONFIG_SERVER_URL: http://config-server:5005
+      HAZELCAST_MEMBERS: hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701
+      QUEUE_NAME: counter-queue
     depends_on:
+      - config-server
       - counter-service
       - logging-service-1
       - logging-service-2

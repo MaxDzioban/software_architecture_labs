@@ -1,13 +1,19 @@
 import json
 import os
 import time
+import requests
+import hazelcast
 
 from flask import Flask, request, jsonify
-import hazelcast
 
 app = Flask(__name__)
 
 INSTANCE_NAME = os.getenv("INSTANCE_NAME", "logging-service")
+SERVICE_NAME = "logging-service"
+SERVICE_HOST = os.getenv("SERVICE_HOST", "logging-service")
+SERVICE_PORT = os.getenv("SERVICE_PORT", "5001")
+CONFIG_SERVER_URL = os.getenv("CONFIG_SERVER_URL", "http://config-server:5005")
+
 HAZELCAST_MEMBERS = os.getenv(
     "HAZELCAST_MEMBERS",
     "hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701"
@@ -16,8 +22,30 @@ HAZELCAST_MEMBERS = os.getenv(
 hazelcast_client = hazelcast.HazelcastClient(
     cluster_members=HAZELCAST_MEMBERS
 )
-
 transactions_map = hazelcast_client.get_map("transactions").blocking()
+
+
+def register_in_config_server():
+    address = f"http://{SERVICE_HOST}:{SERVICE_PORT}"
+    payload = {
+        "service_name": SERVICE_NAME,
+        "address": address
+    }
+
+    for attempt in range(30):
+        try:
+            response = requests.post(f"{CONFIG_SERVER_URL}/register", json=payload, timeout=5)
+            if response.status_code == 200:
+                print(f"[{INSTANCE_NAME}] Registered in config-server: {address}")
+                return
+        except Exception as e:
+            print(f"[{INSTANCE_NAME}] Registration failed, retrying... {e}")
+            time.sleep(2)
+
+    raise RuntimeError(f"[{INSTANCE_NAME}] Could not register in config-server")
+
+
+register_in_config_server()
 
 
 @app.route("/log", methods=["POST"])
@@ -38,9 +66,9 @@ def log_transaction():
         "logged_by": INSTANCE_NAME
     })
 
-    app.logger.info(f"[{INSTANCE_NAME}] Received POST: id={tx_id} user={data['user_id']} amount={data['amount']}")
+    print(f"[{INSTANCE_NAME}] Received POST: id={tx_id} user={data['user_id']} amount={data['amount']}")
     transactions_map.put(tx_id, value)
-    app.logger.info(f"[{INSTANCE_NAME}] Saved to Hazelcast")
+    print(f"[{INSTANCE_NAME}] Saved to Hazelcast")
 
     return jsonify({"status": "ok", "instance": INSTANCE_NAME}), 200
 
