@@ -1,14 +1,10 @@
 from flask_sqlalchemy import SQLAlchemy
-
 db = SQLAlchemy()
-
 
 class Account(db.Model):
     __tablename__ = "accounts"
-
     user_id = db.Column(db.String(100), primary_key=True)
     balance = db.Column(db.Integer, nullable=False, default=0)
-
     def to_dict(self):
         return {
             "user_id": self.user_id,
@@ -18,7 +14,6 @@ class Account(db.Model):
 
 class Transaction(db.Model):
     __tablename__ = "transactions"
-
     transaction_id = db.Column(db.String(100), primary_key=True)
     user_id = db.Column(db.String(100), nullable=False, index=True)
     amount = db.Column(db.Integer, nullable=False)

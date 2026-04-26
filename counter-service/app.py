@@ -19,22 +19,84 @@ DB_HOST = os.getenv("POSTGRES_HOST", "postgres")
 DB_PORT = os.getenv("POSTGRES_PORT", "5432")
 DB_NAME = os.getenv("POSTGRES_DB", "bankdb")
 
-SERVICE_NAME = "counter-service"
-SERVICE_HOST = os.getenv("SERVICE_HOST", "counter-service")
-SERVICE_PORT = os.getenv("SERVICE_PORT", "5002")
-CONFIG_SERVER_URL = os.getenv("CONFIG_SERVER_URL", "http://config-server:5005")
-
-HAZELCAST_MEMBERS = os.getenv(
-    "HAZELCAST_MEMBERS",
-    "hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701"
-).split(",")
-
+HAZELCAST_SERVICE = os.getenv("HAZELCAST_SERVICE", "hazelcast")
+HAZELCAST_PORT = int(os.getenv("HAZELCAST_PORT", "5701"))
 QUEUE_NAME = os.getenv("QUEUE_NAME", "counter-queue")
+
+KUBE_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+KUBE_NAMESPACE_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+KUBE_CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+KUBE_SERVICE_HOST = os.getenv("KUBERNETES_SERVICE_HOST")
+KUBE_SERVICE_PORT = os.getenv("KUBERNETES_SERVICE_PORT", "443")
 
 app.config["SQLALCHEMY_DATABASE_URI"] = (
     f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 )
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+
+def running_in_cluster():
+    return bool(KUBE_SERVICE_HOST and os.path.exists(KUBE_TOKEN_PATH))
+
+
+def read_kubernetes_namespace():
+    if os.path.exists(KUBE_NAMESPACE_PATH):
+        with open(KUBE_NAMESPACE_PATH, "r") as stream:
+            return stream.read().strip()
+    return "default"
+
+
+def get_kubernetes_api_headers():
+    with open(KUBE_TOKEN_PATH, "r") as stream:
+        token = stream.read().strip()
+    return {"Authorization": f"Bearer {token}"}
+
+
+def get_kubernetes_endpoints(service_name: str):
+    if not running_in_cluster():
+        return []
+
+    namespace = read_kubernetes_namespace()
+    url = (
+        f"https://{KUBE_SERVICE_HOST}:{KUBE_SERVICE_PORT}"
+        f"/api/v1/namespaces/{namespace}/endpoints/{service_name}"
+    )
+
+    try:
+        response = requests.get(
+            url,
+            headers=get_kubernetes_api_headers(),
+            verify=KUBE_CA_PATH,
+            timeout=5,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except Exception:
+        return []
+
+    members = []
+    for subset in data.get("subsets", []):
+        ports = subset.get("ports", [])
+        addresses = subset.get("addresses", [])
+        for address in addresses:
+            for port in ports:
+                members.append(f"{address['ip']}:{port['port']}")
+
+    return members
+
+
+def get_hazelcast_members():
+    members = get_kubernetes_endpoints(HAZELCAST_SERVICE)
+    if members:
+        return members
+    return [f"{HAZELCAST_SERVICE}:{HAZELCAST_PORT}"]
+
+hazelcast_client = hazelcast.HazelcastClient(
+    cluster_members=get_hazelcast_members()
+)
+
+counter_queue = hazelcast_client.get_queue(QUEUE_NAME).blocking()
+
 
 db.init_app(app)
 
@@ -45,45 +107,23 @@ def wait_for_db(max_retries=30, delay=2):
             with app.app_context():
                 db.session.execute(text("SELECT 1"))
                 db.session.commit()
+
             print(f"[counter-service] Database is ready on attempt {attempt}")
             return
+
         except OperationalError as e:
-            print(f"[counter-service] Database not ready yet (attempt {attempt}/{max_retries}): {e}")
+            print(
+                f"[counter-service] Database not ready yet "
+                f"(attempt {attempt}/{max_retries}): {e}"
+            )
             time.sleep(delay)
 
     raise RuntimeError("Database did not become ready in time")
 
 
-def register_in_config_server():
-    address = f"http://{SERVICE_HOST}:{SERVICE_PORT}"
-    payload = {
-        "service_name": SERVICE_NAME,
-        "address": address
-    }
-
-    for attempt in range(30):
-        try:
-            response = requests.post(f"{CONFIG_SERVER_URL}/register", json=payload, timeout=5)
-            if response.status_code == 200:
-                print(f"[counter-service] Registered in config-server: {address}")
-                return
-        except Exception as e:
-            print(f"[counter-service] Registration failed, retrying... {e}")
-            time.sleep(2)
-
-    raise RuntimeError("[counter-service] Could not register in config-server")
-
-
 with app.app_context():
     wait_for_db()
     db.create_all()
-
-register_in_config_server()
-
-hazelcast_client = hazelcast.HazelcastClient(
-    cluster_members=HAZELCAST_MEMBERS
-)
-counter_queue = hazelcast_client.get_queue(QUEUE_NAME).blocking()
 
 
 def apply_transaction_to_db(data):
@@ -127,8 +167,10 @@ def consumer_loop():
 
             with app.app_context():
                 apply_transaction_to_db(data)
-
-            print(f"[counter-service] Applied transaction {data['transaction_id']} for user {data['user_id']}")
+            print(
+                f"[counter-service] Applied transaction "
+                f"{data['transaction_id']} for user {data['user_id']}"
+            )
         except Exception as e:
             print(f"[counter-service] Consumer error: {e}")
             time.sleep(1)

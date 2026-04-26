@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: logging-service
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: logging-service
+  template:
+    metadata:
+      labels:
+        app: logging-service
+    spec:
+      serviceAccountName: app-discovery-sa
+      containers:
+        - name: logging-service
+          image: logging-service:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 5001
+          envFrom:
+            - configMapRef:
+                name: app-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: logging-service
+spec:
+  selector:
+    app: logging-service
+  ports:
+    - port: 5001
+      targetPort: 5001

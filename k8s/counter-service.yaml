@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: counter-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: counter-service
+  template:
+    metadata:
+      labels:
+        app: counter-service
+    spec:
+      serviceAccountName: app-discovery-sa
+      containers:
+        - name: counter-service
+          image: counter-service:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 5002
+          envFrom:
+            - configMapRef:
+                name: app-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: counter-service
+spec:
+  selector:
+    app: counter-service
+  ports:
+    - port: 5002
+      targetPort: 5002

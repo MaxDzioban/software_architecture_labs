@@ -9,43 +9,75 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 INSTANCE_NAME = os.getenv("INSTANCE_NAME", "logging-service")
-SERVICE_NAME = "logging-service"
-SERVICE_HOST = os.getenv("SERVICE_HOST", "logging-service")
-SERVICE_PORT = os.getenv("SERVICE_PORT", "5001")
-CONFIG_SERVER_URL = os.getenv("CONFIG_SERVER_URL", "http://config-server:5005")
+HAZELCAST_SERVICE = os.getenv("HAZELCAST_SERVICE", "hazelcast")
+HAZELCAST_PORT = int(os.getenv("HAZELCAST_PORT", "5701"))
+KUBE_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+KUBE_NAMESPACE_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+KUBE_CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+KUBE_SERVICE_HOST = os.getenv("KUBERNETES_SERVICE_HOST")
+KUBE_SERVICE_PORT = os.getenv("KUBERNETES_SERVICE_PORT", "443")
 
-HAZELCAST_MEMBERS = os.getenv(
-    "HAZELCAST_MEMBERS",
-    "hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701"
-).split(",")
+
+def running_in_cluster():
+    return bool(KUBE_SERVICE_HOST and os.path.exists(KUBE_TOKEN_PATH))
+
+
+def read_kubernetes_namespace():
+    if os.path.exists(KUBE_NAMESPACE_PATH):
+        with open(KUBE_NAMESPACE_PATH, "r") as stream:
+            return stream.read().strip()
+    return "default"
+
+
+def get_kubernetes_api_headers():
+    with open(KUBE_TOKEN_PATH, "r") as stream:
+        token = stream.read().strip()
+    return {"Authorization": f"Bearer {token}"}
+
+
+def get_kubernetes_endpoints(service_name: str):
+    if not running_in_cluster():
+        return []
+
+    namespace = read_kubernetes_namespace()
+    url = (
+        f"https://{KUBE_SERVICE_HOST}:{KUBE_SERVICE_PORT}"
+        f"/api/v1/namespaces/{namespace}/endpoints/{service_name}"
+    )
+
+    try:
+        response = requests.get(
+            url,
+            headers=get_kubernetes_api_headers(),
+            verify=KUBE_CA_PATH,
+            timeout=5,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except Exception:
+        return []
+
+    instances = []
+    for subset in data.get("subsets", []):
+        ports = subset.get("ports", [])
+        addresses = subset.get("addresses", [])
+        for address in addresses:
+            for port in ports:
+                instances.append(f"{address['ip']}:{port['port']}")
+
+    return instances
+
+
+def get_hazelcast_members():
+    members = get_kubernetes_endpoints(HAZELCAST_SERVICE)
+    if members:
+        return members
+    return [f"{HAZELCAST_SERVICE}:{HAZELCAST_PORT}"]
 
 hazelcast_client = hazelcast.HazelcastClient(
-    cluster_members=HAZELCAST_MEMBERS
+    cluster_members=get_hazelcast_members()
 )
 transactions_map = hazelcast_client.get_map("transactions").blocking()
-
-
-def register_in_config_server():
-    address = f"http://{SERVICE_HOST}:{SERVICE_PORT}"
-    payload = {
-        "service_name": SERVICE_NAME,
-        "address": address
-    }
-
-    for attempt in range(30):
-        try:
-            response = requests.post(f"{CONFIG_SERVER_URL}/register", json=payload, timeout=5)
-            if response.status_code == 200:
-                print(f"[{INSTANCE_NAME}] Registered in config-server: {address}")
-                return
-        except Exception as e:
-            print(f"[{INSTANCE_NAME}] Registration failed, retrying... {e}")
-            time.sleep(2)
-
-    raise RuntimeError(f"[{INSTANCE_NAME}] Could not register in config-server")
-
-
-register_in_config_server()
 
 
 @app.route("/log", methods=["POST"])
@@ -70,7 +102,10 @@ def log_transaction():
     transactions_map.put(tx_id, value)
     print(f"[{INSTANCE_NAME}] Saved to Hazelcast")
 
-    return jsonify({"status": "ok", "instance": INSTANCE_NAME}), 200
+    return jsonify({
+        "status": "ok",
+        "instance": INSTANCE_NAME
+    }), 200
 
 
 @app.route("/transactions", methods=["GET"])
@@ -87,7 +122,6 @@ def get_all_transactions():
 def get_transactions_by_user(user_id):
     entries = transactions_map.entry_set()
     transactions = []
-
     for _, value in entries:
         item = json.loads(value)
         if str(item["user_id"]) == str(user_id):

@@ -11,20 +11,92 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-SERVICE_NAME = "facade-service"
-SERVICE_HOST = os.getenv("SERVICE_HOST", "facade-service")
-SERVICE_PORT = os.getenv("SERVICE_PORT", "5000")
-CONFIG_SERVER_URL = os.getenv("CONFIG_SERVER_URL", "http://config-server:5005")
-
-HAZELCAST_MEMBERS = os.getenv(
-    "HAZELCAST_MEMBERS",
-    "hazelcast-1:5701,hazelcast-2:5701,hazelcast-3:5701"
-).split(",")
-
+SERVICE_HOST = os.getenv("SERVICE_HOST", "0.0.0.0")
+SERVICE_PORT = int(os.getenv("SERVICE_PORT", "5000"))
+HAZELCAST_SERVICE = os.getenv("HAZELCAST_SERVICE", "hazelcast")
+HAZELCAST_PORT = int(os.getenv("HAZELCAST_PORT", "5701"))
 QUEUE_NAME = os.getenv("QUEUE_NAME", "counter-queue")
+LOGGING_SERVICE_NAME = os.getenv("LOGGING_SERVICE_NAME", "logging-service")
+LOGGING_SERVICE_PORT = int(os.getenv("LOGGING_SERVICE_PORT", "5001"))
+COUNTER_SERVICE_NAME = os.getenv("COUNTER_SERVICE_NAME", "counter-service")
+COUNTER_SERVICE_PORT = int(os.getenv("COUNTER_SERVICE_PORT", "5002"))
+
+KUBE_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+KUBE_NAMESPACE_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+KUBE_CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+KUBE_SERVICE_HOST = os.getenv("KUBERNETES_SERVICE_HOST")
+KUBE_SERVICE_PORT = os.getenv("KUBERNETES_SERVICE_PORT", "443")
+
+
+def running_in_cluster():
+    return bool(KUBE_SERVICE_HOST and os.path.exists(KUBE_TOKEN_PATH))
+
+
+def read_kubernetes_namespace():
+    if os.path.exists(KUBE_NAMESPACE_PATH):
+        with open(KUBE_NAMESPACE_PATH, "r") as stream:
+            return stream.read().strip()
+    return "default"
+
+
+def get_kubernetes_api_headers():
+    with open(KUBE_TOKEN_PATH, "r") as stream:
+        token = stream.read().strip()
+    return {"Authorization": f"Bearer {token}"}
+
+
+def get_kubernetes_endpoints(service_name: str):
+    if not running_in_cluster():
+        return []
+
+    namespace = read_kubernetes_namespace()
+    url = (
+        f"https://{KUBE_SERVICE_HOST}:{KUBE_SERVICE_PORT}"
+        f"/api/v1/namespaces/{namespace}/endpoints/{service_name}"
+    )
+
+    try:
+        response = requests.get(
+            url,
+            headers=get_kubernetes_api_headers(),
+            verify=KUBE_CA_PATH,
+            timeout=5,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except Exception:
+        return []
+
+    instances = []
+    for subset in data.get("subsets", []):
+        ports = subset.get("ports", [])
+        addresses = subset.get("addresses", [])
+        for address in addresses:
+            for port in ports:
+                instances.append(f"http://{address['ip']}:{port['port']}")
+
+    return instances
+
+
+def get_service_instances(service_name: str, default_port: int):
+    instances = get_kubernetes_endpoints(service_name)
+    if instances:
+        return instances
+    return [f"http://{service_name}:{default_port}"]
+
+
+def get_hazelcast_members():
+    members = []
+    if running_in_cluster():
+        endpoints = get_kubernetes_endpoints(HAZELCAST_SERVICE)
+        for endpoint in endpoints:
+            members.append(endpoint.replace("http://", ""))
+    if not members:
+        members.append(f"{HAZELCAST_SERVICE}:{HAZELCAST_PORT}")
+    return members
 
 hazelcast_client = hazelcast.HazelcastClient(
-    cluster_members=HAZELCAST_MEMBERS
+    cluster_members=get_hazelcast_members()
 )
 counter_queue = hazelcast_client.get_queue(QUEUE_NAME).blocking()
 
@@ -32,31 +104,13 @@ stats_lock = Lock()
 stats = {
     "logging_calls": 0,
     "logging_time_sec": 0.0,
+    "counter_calls": 0,
+    "counter_time_sec": 0.0,
     "counter_queue_puts": 0,
     "counter_queue_time_sec": 0.0,
     "config_calls": 0,
-    "config_time_sec": 0.0
+    "config_time_sec": 0.0,
 }
-
-
-def register_in_config_server():
-    address = f"http://{SERVICE_HOST}:{SERVICE_PORT}"
-    payload = {
-        "service_name": SERVICE_NAME,
-        "address": address
-    }
-
-    for attempt in range(30):
-        try:
-            response = requests.post(f"{CONFIG_SERVER_URL}/register", json=payload, timeout=5)
-            if response.status_code == 200:
-                print(f"[facade-service] Registered in config-server: {address}")
-                return
-        except Exception as e:
-            print(f"[facade-service] Registration failed, retrying... {e}")
-            time.sleep(2)
-
-    raise RuntimeError("[facade-service] Could not register in config-server")
 
 
 def add_stat(service_name: str, elapsed: float):
@@ -67,6 +121,8 @@ def add_stat(service_name: str, elapsed: float):
         elif service_name == "counter_queue":
             stats["counter_queue_puts"] += 1
             stats["counter_queue_time_sec"] += elapsed
+            stats["counter_calls"] += 1
+            stats["counter_time_sec"] += elapsed
         elif service_name == "config":
             stats["config_calls"] += 1
             stats["config_time_sec"] += elapsed
@@ -79,52 +135,32 @@ def timed_request(method: str, url: str, **kwargs):
     return response, elapsed
 
 
-def get_service_instances(service_name: str):
-    response, elapsed = timed_request("GET", f"{CONFIG_SERVER_URL}/services/{service_name}")
-    add_stat("config", elapsed)
-
-    if response.status_code != 200:
-        raise RuntimeError(f"config-server failed for {service_name}")
-
-    instances = response.json().get("instances", [])
-    if not instances:
-        raise RuntimeError(f"No instances found for service {service_name}")
-
-    return instances
-
-
 def call_logging_with_retry(method: str, path: str, **kwargs):
-    endpoints = get_service_instances("logging-service")
+    endpoints = get_service_instances(LOGGING_SERVICE_NAME, LOGGING_SERVICE_PORT)
     random.shuffle(endpoints)
 
     last_error = None
-
     for base_url in endpoints:
         try:
             url = f"{base_url}{path}"
             response, elapsed = timed_request(method, url, **kwargs)
             add_stat("logging", elapsed)
-
             if response.status_code < 500:
                 return response
-        except Exception as e:
-            last_error = e
+        except Exception as exc:
+            last_error = exc
 
     if last_error:
         raise last_error
-
     raise RuntimeError("All logging-service instances failed")
 
 
 def call_counter_get(path: str):
-    instances = get_service_instances("counter-service")
-    base_url = random.choice(instances)
+    endpoints = get_service_instances(COUNTER_SERVICE_NAME, COUNTER_SERVICE_PORT)
+    base_url = random.choice(endpoints)
 
     response, _ = timed_request("GET", f"{base_url}{path}")
     return response
-
-
-register_in_config_server()
 
 
 @app.route("/transaction", methods=["POST"])
@@ -226,6 +262,10 @@ def get_stats():
         result["counter_queue_time_sec"] / result["counter_queue_puts"] * 1000
         if result["counter_queue_puts"] else 0.0
     )
+    result["counter_avg_ms"] = (
+        result["counter_time_sec"] / result["counter_calls"] * 1000
+        if result["counter_calls"] else 0.0
+    )
     result["config_avg_ms"] = (
         result["config_time_sec"] / result["config_calls"] * 1000
         if result["config_calls"] else 0.0
@@ -239,6 +279,8 @@ def reset_stats():
     with stats_lock:
         stats["logging_calls"] = 0
         stats["logging_time_sec"] = 0.0
+        stats["counter_calls"] = 0
+        stats["counter_time_sec"] = 0.0
         stats["counter_queue_puts"] = 0
         stats["counter_queue_time_sec"] = 0.0
         stats["config_calls"] = 0

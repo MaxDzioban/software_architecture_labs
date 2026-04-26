@@ -1,10 +1,11 @@
 import time
 import json
+import os
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 
-FACADE_URL = "http://localhost:5000"
+FACADE_URL = os.getenv("FACADE_URL", "http://localhost:5000")
 
 def do_posts(user_id: str, count: int, amount: int):
     session = requests.Session()
